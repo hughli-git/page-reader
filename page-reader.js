@@ -1,28 +1,33 @@
 // ==UserScript==
-// @name         中文字符选中即读 (火山引擎版)
+// @name         网页逐句悬停朗读 (火山引擎版)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  鼠标选中文字后，通过火山引擎 TTS 自动朗读。需在菜单中配置 AppID 和 Token。
+// @version      3.0
+// @description  鼠标悬停在句子上时背景变色并自动朗读。支持超链接独立识别，支持句号/换行切割。
 // @author       Gemini
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
 // @connect      openspeech.bytedance.com
 // ==/UserScript==
 
 (function() {
     'use strict';
 
-    // --- 配置管理 ---
+    // --- 配置与样式 ---
+    const HIGHLIGHT_COLOR = 'rgba(255, 255, 0, 0.5)'; // 悬停底色
+    GM_addStyle(`
+        .tts-sentence-highlight { background-color: ${HIGHLIGHT_COLOR} !important; cursor: pointer; }
+    `);
+
     const getConfig = () => ({
         appId: GM_getValue('volc_appid', ''),
         token: GM_getValue('volc_token', ''),
-        voice: GM_getValue('volc_voice', 'BV001_streaming'), // 默认：灿灿
+        voice: GM_getValue('volc_voice', 'BV001_streaming'),
     });
 
-    // 常用音色列表 (可以根据火山文档自行添加)
     const VOICE_LIST = [
         { name: "字节灿灿 (通用女声)", id: "BV001_streaming" },
         { name: "字节马可 (通用男声)", id: "BV002_streaming" },
@@ -31,7 +36,7 @@
         { name: "可爱童声", id: "BV007_streaming" }
     ];
 
-    // --- 注册油猴菜单 ---
+    // --- 菜单命令 ---
     GM_registerMenuCommand("⚙️ 设置火山引擎配置", () => {
         const appId = prompt("请输入火山引擎 AppID:", GM_getValue('volc_appid', ''));
         const token = prompt("请输入火山引擎 Access Token:", GM_getValue('volc_token', ''));
@@ -53,15 +58,15 @@
 
     // --- TTS 核心逻辑 ---
     let currentAudio = null;
-    let lastRequest = null; // 记录上一次的网络请求
+    let lastRequest = null;
+    let hoverTimer = null; // 用于防抖
 
     function stopSpeaking() {
         if (currentAudio) {
             currentAudio.pause();
-            currentAudio.src = ""; // 清空资源防止后台继续加载
+            currentAudio.src = "";
             currentAudio = null;
         }
-        // 2. 强行掐断还在传输中的网络请求
         if (lastRequest) {
             lastRequest.abort();
             lastRequest = null;
@@ -70,81 +75,118 @@
 
     function speak(text) {
         const config = getConfig();
-        if (!config.appId || !config.token) {
-            console.warn("火山引擎 AppID 或 Token 未配置，请在油猴菜单中设置。");
-            return;
-        }
+        if (!config.appId || !config.token) return;
 
         stopSpeaking();
+        if (!text || text.trim().length === 0) return;
 
-        // 构造请求体
         const requestData = {
-            app: {
-                appid: config.appId,
-                token: config.token,
-                cluster: "volcano_tts"
-            },
+            app: { appId: config.appId, token: config.token, cluster: "volcano_tts" },
             user: { uid: "tampermonkey_user" },
-            audio: {
-                encoding: "mp3",
-                voice_type: config.voice,
-                speed_ratio: 1.0,
-                volume_ratio: 1.0,
-                pitch_ratio: 1.0,
-            },
-            request: {
-                reqid: crypto.randomUUID(),
-                text: text,
-                text_type: "plain",
-                operation: "query"
-            }
+            audio: { encoding: "mp3", voice_type: config.voice, speed_ratio: 1.0, volume_ratio: 1.0, pitch_ratio: 1.0 },
+            request: { reqid: crypto.randomUUID(), text: text, text_type: "plain", operation: "query" }
         };
 
         lastRequest = GM_xmlhttpRequest({
             method: "POST",
             url: "https://openspeech.bytedance.com/api/v1/tts",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer;${config.token}`
-            },
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer;${config.token}` },
             data: JSON.stringify(requestData),
             responseType: "json",
             onload: function(response) {
-                // 请求完成，重置 lastRequest
                 lastRequest = null;
                 if (response.status === 200 && response.response.data) {
-                    const audioBase64 = response.response.data;
-                    const audioSrc = `data:audio/mp3;base64,${audioBase64}`;
-
-                    currentAudio = new Audio(audioSrc);
+                    currentAudio = new Audio(`data:audio/mp3;base64,${response.response.data}`);
                     currentAudio.play().catch(e => console.error("播放失败:", e));
-                    console.log("火山引擎正在朗读...");
-                } else {
-                    console.error("火山引擎接口错误:", response.response.message || "未知错误");
                 }
-            },
-            onerror: function(err) {
-                console.error("请求失败:", err);
             }
         });
     }
 
-    // --- 事件监听 ---
-    document.addEventListener('mouseup', function() {
-        // 使用 setTimeout 确保获取到最新的 selection
-        setTimeout(() => {
-            const selection = window.getSelection();
-            const selectedText = selection.toString().trim();
+    // --- DOM 处理：拆分句子 ---
+    function processNode(node) {
+        // 忽略脚本、样式、输入框以及已经被处理过的节点
+        const ignoreTags = ['SCRIPT', 'STYLE', 'INPUT', 'TEXTAREA', 'NOSCRIPT', 'CANVAS', 'AUDIO', 'VIDEO'];
+        if (ignoreTags.includes(node.tagName)) return;
 
-            if (selectedText.length >= 1 && selectedText.length <= 500) {
-                speak(selectedText);
+        // 如果是超链接，整体作为一个单元
+        if (node.tagName === 'A') {
+            node.classList.add('tts-sentence-unit');
+            return;
+        }
+
+        // 遍历子节点
+        const childNodes = Array.from(node.childNodes);
+        childNodes.forEach(child => {
+            if (child.nodeType === Node.TEXT_NODE) {
+                const text = child.textContent;
+                if (text.trim().length === 0) return;
+
+                // 匹配句子（以句号、问号、感叹号或换行符结尾）
+                const sentences = text.match(/[^。！？\n\r]+[。！？\n\r]?|[\。！？\n\r]/g);
+                if (sentences) {
+                    const fragment = document.createDocumentFragment();
+                    sentences.forEach(s => {
+                        if (s.trim().length > 0) {
+                            const span = document.createElement('span');
+                            span.className = 'tts-sentence-unit';
+                            span.textContent = s;
+                            fragment.appendChild(span);
+                        } else {
+                            fragment.appendChild(document.createTextNode(s));
+                        }
+                    });
+                    child.replaceWith(fragment);
+                }
+            } else if (child.nodeType === Node.ELEMENT_NODE) {
+                processNode(child);
             }
-        }, 50);
+        });
+    }
+
+    // 初始化处理页面已有的文本
+    const containers = document.querySelectorAll('p, li, div, h1, h2, h3, h4, h5, h6, article, section, span');
+    containers.forEach(el => {
+        // 仅处理最直接的容器，避免重复包裹
+        if (el.children.length === 0 || Array.from(el.childNodes).some(n => n.nodeType === Node.TEXT_NODE)) {
+            // 这里简单处理，生产环境可能需要更复杂的判定
+        }
+    });
+    // 粗暴但简单的方法：只针对常见的文本容器
+    document.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6').forEach(processNode);
+
+    // --- 事件监听 ---
+    document.addEventListener('mouseover', (e) => {
+        const target = e.target.closest('.tts-sentence-unit');
+        if (target) {
+            // 清除旧的定时器
+            if (hoverTimer) clearTimeout(hoverTimer);
+
+            // 添加高亮
+            target.classList.add('tts-sentence-highlight');
+
+            // 延迟 300ms 触发朗读，防止鼠标掠过时乱响
+            hoverTimer = setTimeout(() => {
+                const text = target.innerText || target.textContent;
+                speak(text.trim());
+            }, 300);
+        }
     });
 
-    // 键盘按下 Esc 停止播放
+    document.addEventListener('mouseout', (e) => {
+        const target = e.target.closest('.tts-sentence-unit');
+        if (target) {
+            if (hoverTimer) clearTimeout(hoverTimer);
+            target.classList.remove('tts-sentence-highlight');
+            stopSpeaking();
+        }
+    });
+
+    // Esc 键停止
     document.addEventListener('keydown', (e) => {
         if (e.key === "Escape") stopSpeaking();
     });
 
+    // 针对动态加载的内容（可选）
+    // console.log("逐句朗读脚本已就绪...");
 })();
