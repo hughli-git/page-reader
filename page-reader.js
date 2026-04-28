@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         网页逐句悬停朗读 (火山引擎版)
+// @name         网页逐句悬停朗读 (修复加强版)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  鼠标悬停在句子上时背景变色并自动朗读。支持超链接独立识别，支持句号/换行切割。
+// @version      3.1
+// @description  鼠标悬停变色并朗读。链接独立，普通句子不被链接切断。修复了无法朗读的问题。
 // @author       Gemini
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -16,177 +16,204 @@
 (function() {
     'use strict';
 
-    // --- 配置与样式 ---
-    const HIGHLIGHT_COLOR = 'rgba(255, 255, 0, 0.5)'; // 悬停底色
+    // --- 样式配置 ---
+    const HIGHLIGHT_BG = 'rgba(255, 255, 0, 0.4)';
     GM_addStyle(`
-        .tts-sentence-highlight { background-color: ${HIGHLIGHT_COLOR} !important; cursor: pointer; }
+        .v-tts-highlight { background-color: ${HIGHLIGHT_BG} !important; border-radius: 2px; }
     `);
 
+    // --- 配置管理 ---
     const getConfig = () => ({
         appId: GM_getValue('volc_appid', ''),
         token: GM_getValue('volc_token', ''),
         voice: GM_getValue('volc_voice', 'BV001_streaming'),
     });
 
-    const VOICE_LIST = [
-        { name: "字节灿灿 (通用女声)", id: "BV001_streaming" },
-        { name: "字节马可 (通用男声)", id: "BV002_streaming" },
-        { name: "精品女声-甜美", id: "BV056_streaming" },
-        { name: "精品男声-阳光", id: "BV051_streaming" },
-        { name: "可爱童声", id: "BV007_streaming" }
-    ];
-
-    // --- 菜单命令 ---
-    GM_registerMenuCommand("⚙️ 设置火山引擎配置", () => {
-        const appId = prompt("请输入火山引擎 AppID:", GM_getValue('volc_appid', ''));
-        const token = prompt("请输入火山引擎 Access Token:", GM_getValue('volc_token', ''));
-        if (appId !== null) GM_setValue('volc_appid', appId);
-        if (token !== null) GM_setValue('volc_token', token);
-        alert("配置已保存！");
-    });
-
-    GM_registerMenuCommand("🔊 切换音色", () => {
-        let menuText = "请选择音色编号:\n\n";
-        VOICE_LIST.forEach((v, i) => menuText += `${i + 1}. ${v.name}\n`);
-        const choice = prompt(menuText);
-        if (choice && VOICE_LIST[choice - 1]) {
-            const v = VOICE_LIST[choice - 1];
-            GM_setValue('volc_voice', v.id);
-            alert(`已切换至: ${v.name}`);
-        }
-    });
-
-    // --- TTS 核心逻辑 ---
+    // --- 语音核心 ---
     let currentAudio = null;
     let lastRequest = null;
-    let hoverTimer = null; // 用于防抖
+    let hoverTimer = null;
+    let lastText = ""; // 防止重复触发
 
     function stopSpeaking() {
-        if (currentAudio) {
-            currentAudio.pause();
-            currentAudio.src = "";
-            currentAudio = null;
-        }
-        if (lastRequest) {
-            lastRequest.abort();
-            lastRequest = null;
-        }
+        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        if (lastRequest) { lastRequest.abort(); lastRequest = null; }
     }
 
     function speak(text) {
+        if (!text || text === lastText) return;
         const config = getConfig();
-        if (!config.appId || !config.token) return;
+        if (!config.appId || !config.token) {
+            console.warn("TTS: 请先在油猴菜单配置 AppID 和 Token");
+            return;
+        }
 
         stopSpeaking();
-        if (!text || text.trim().length === 0) return;
+        lastText = text;
+
+        // 简易 UUID 替代 crypto.randomUUID (兼容性更好)
+        const reqid = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
 
         const requestData = {
-            app: { appId: config.appId, token: config.token, cluster: "volcano_tts" },
-            user: { uid: "tampermonkey_user" },
-            audio: { encoding: "mp3", voice_type: config.voice, speed_ratio: 1.0, volume_ratio: 1.0, pitch_ratio: 1.0 },
-            request: { reqid: crypto.randomUUID(), text: text, text_type: "plain", operation: "query" }
+            app: { appid: config.appId, token: config.token, cluster: "volcano_tts" },
+            user: { uid: "user_123" },
+            audio: {
+                encoding: "mp3",
+                voice_type: config.voice,
+                speed_ratio: 1.0,
+                volume_ratio: 1.0,
+                pitch_ratio: 1.0,
+            },
+            request: {
+                reqid: reqid,
+                text: text,
+                text_type: "plain",
+                operation: "query"
+            }
         };
 
         lastRequest = GM_xmlhttpRequest({
             method: "POST",
             url: "https://openspeech.bytedance.com/api/v1/tts",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer;${config.token}` },
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer;${config.token}`
+            },
             data: JSON.stringify(requestData),
             responseType: "json",
-            onload: function(response) {
-                lastRequest = null;
-                if (response.status === 200 && response.response.data) {
-                    currentAudio = new Audio(`data:audio/mp3;base64,${response.response.data}`);
+            onload: function(res) {
+                if (res.status === 200 && res.response && res.response.data) {
+                    const audioSrc = `data:audio/mp3;base64,${res.response.data}`;
+                    currentAudio = new Audio(audioSrc);
                     currentAudio.play().catch(e => console.error("播放失败:", e));
+                } else {
+                    console.error("TTS 接口报错:", res.response ? res.response.message : "未知错误");
+                    lastText = ""; // 报错了清空，允许重试
+                }
+            },
+            onerror: () => { lastText = ""; }
+        });
+    }
+
+    // --- 文本提取逻辑 ---
+    // 获取鼠标下的句子
+    function getSentenceFromEvent(e) {
+        const target = e.target;
+
+        // 1. 如果是超链接，直接返回超链接文字
+        if (target.tagName === 'A' || target.closest('a')) {
+            const link = target.tagName === 'A' ? target : target.closest('a');
+            return { text: link.innerText.trim(), element: link };
+        }
+
+        // 2. 如果是普通文本，寻找包含当前位置的“断句”
+        const selection = window.getSelection();
+        const range = document.caretRangeFromPoint(e.clientX, e.clientY);
+        if (!range) return null;
+
+        const container = range.startContainer;
+        if (container.nodeType !== Node.TEXT_NODE) return null;
+
+        const fullText = container.textContent;
+        const offset = range.startOffset;
+
+        // 向前向后寻找标点符号断句（。！？\n）
+        const stopChars = /[。！？\n\r]/;
+        let start = offset;
+        while (start > 0 && !stopChars.test(fullText[start - 1])) {
+            start--;
+        }
+        let end = offset;
+        while (end < fullText.length && !stopChars.test(fullText[end])) {
+            end++;
+        }
+
+        // 如果后面跟着标点，把标点也带上
+        if (end < fullText.length && stopChars.test(fullText[end])) {
+            end++;
+        }
+
+        const sentence = fullText.substring(start, end).trim();
+        if (sentence.length < 2) return null; // 过滤单个字符
+
+        // 为了实现高亮，我们还是需要包裹这个范围
+        return { text: sentence, range: [start, end], node: container };
+    }
+
+    // --- 交互处理 ---
+    let highlightSpan = document.createElement('span');
+    highlightSpan.className = 'v-tts-highlight';
+
+    document.addEventListener('mousemove', (e) => {
+        // 防抖：避免鼠标移动过程中高频触发
+        if (hoverTimer) clearTimeout(hoverTimer);
+
+        hoverTimer = setTimeout(() => {
+            const result = getSentenceFromEvent(e);
+
+            // 清理旧高亮
+            removeHighlight();
+
+            if (result) {
+                if (result.element) {
+                    // 处理链接高亮
+                    result.element.classList.add('v-tts-highlight');
+                } else {
+                    // 处理普通文本高亮 (不破坏 DOM 的临时方案)
+                    applyTextHighlight(result.node, result.range);
+                }
+                speak(result.text);
+            } else {
+                stopSpeaking();
+                lastText = "";
+            }
+        }, 200); // 200ms 悬停判定
+    });
+
+    function removeHighlight() {
+        document.querySelectorAll('.v-tts-highlight').forEach(el => {
+            if (el.tagName === 'A') {
+                el.classList.remove('v-tts-highlight');
+            } else {
+                // 还原被包裹的文本
+                const parent = el.parentNode;
+                if (parent) {
+                    parent.replaceChild(document.createTextNode(el.innerText), el);
+                    parent.normalize(); // 合并相邻文本节点
                 }
             }
         });
     }
 
-    // --- DOM 处理：拆分句子 ---
-    function processNode(node) {
-        // 忽略脚本、样式、输入框以及已经被处理过的节点
-        const ignoreTags = ['SCRIPT', 'STYLE', 'INPUT', 'TEXTAREA', 'NOSCRIPT', 'CANVAS', 'AUDIO', 'VIDEO'];
-        if (ignoreTags.includes(node.tagName)) return;
+    function applyTextHighlight(node, rangeIndices) {
+        try {
+            const text = node.textContent;
+            const before = text.substring(0, rangeIndices[0]);
+            const mid = text.substring(rangeIndices[0], rangeIndices[1]);
+            const after = text.substring(rangeIndices[1]);
 
-        // 如果是超链接，整体作为一个单元
-        if (node.tagName === 'A') {
-            node.classList.add('tts-sentence-unit');
-            return;
-        }
+            const span = document.createElement('span');
+            span.className = 'v-tts-highlight';
+            span.innerText = mid;
 
-        // 遍历子节点
-        const childNodes = Array.from(node.childNodes);
-        childNodes.forEach(child => {
-            if (child.nodeType === Node.TEXT_NODE) {
-                const text = child.textContent;
-                if (text.trim().length === 0) return;
+            const fragment = document.createDocumentFragment();
+            fragment.appendChild(document.createTextNode(before));
+            fragment.appendChild(span);
+            fragment.appendChild(document.createTextNode(after));
 
-                // 匹配句子（以句号、问号、感叹号或换行符结尾）
-                const sentences = text.match(/[^。！？\n\r]+[。！？\n\r]?|[\。！？\n\r]/g);
-                if (sentences) {
-                    const fragment = document.createDocumentFragment();
-                    sentences.forEach(s => {
-                        if (s.trim().length > 0) {
-                            const span = document.createElement('span');
-                            span.className = 'tts-sentence-unit';
-                            span.textContent = s;
-                            fragment.appendChild(span);
-                        } else {
-                            fragment.appendChild(document.createTextNode(s));
-                        }
-                    });
-                    child.replaceWith(fragment);
-                }
-            } else if (child.nodeType === Node.ELEMENT_NODE) {
-                processNode(child);
-            }
-        });
+            node.replaceWith(fragment);
+        } catch (e) {}
     }
 
-    // 初始化处理页面已有的文本
-    const containers = document.querySelectorAll('p, li, div, h1, h2, h3, h4, h5, h6, article, section, span');
-    containers.forEach(el => {
-        // 仅处理最直接的容器，避免重复包裹
-        if (el.children.length === 0 || Array.from(el.childNodes).some(n => n.nodeType === Node.TEXT_NODE)) {
-            // 这里简单处理，生产环境可能需要更复杂的判定
-        }
-    });
-    // 粗暴但简单的方法：只针对常见的文本容器
-    document.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6').forEach(processNode);
-
-    // --- 事件监听 ---
-    document.addEventListener('mouseover', (e) => {
-        const target = e.target.closest('.tts-sentence-unit');
-        if (target) {
-            // 清除旧的定时器
-            if (hoverTimer) clearTimeout(hoverTimer);
-
-            // 添加高亮
-            target.classList.add('tts-sentence-highlight');
-
-            // 延迟 300ms 触发朗读，防止鼠标掠过时乱响
-            hoverTimer = setTimeout(() => {
-                const text = target.innerText || target.textContent;
-                speak(text.trim());
-            }, 300);
-        }
+    // --- 菜单 ---
+    GM_registerMenuCommand("⚙️ 配置火山引擎", () => {
+        const appId = prompt("AppID:", GM_getValue('volc_appid', ''));
+        const token = prompt("Access Token:", GM_getValue('volc_token', ''));
+        if (appId) GM_setValue('volc_appid', appId);
+        if (token) GM_setValue('volc_token', token);
+        alert("保存成功！");
     });
 
-    document.addEventListener('mouseout', (e) => {
-        const target = e.target.closest('.tts-sentence-unit');
-        if (target) {
-            if (hoverTimer) clearTimeout(hoverTimer);
-            target.classList.remove('tts-sentence-highlight');
-            stopSpeaking();
-        }
-    });
+    document.addEventListener('keydown', (e) => { if (e.key === "Escape") stopSpeaking(); });
 
-    // Esc 键停止
-    document.addEventListener('keydown', (e) => {
-        if (e.key === "Escape") stopSpeaking();
-    });
-
-    // 针对动态加载的内容（可选）
-    // console.log("逐句朗读脚本已就绪...");
 })();
