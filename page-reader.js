@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         中文字符指即读
+// @name         中文字符指即读 (增强版)
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  鼠标移动到汉字上时自动朗读该汉字
+// @version      1.1
+// @description  鼠标移动到汉字上时自动朗读，增加激活提醒
 // @author       Gemini
 // @match        *://*/*
 // @grant        none
@@ -11,59 +11,78 @@
 (function() {
     'use strict';
 
-    let lastChar = ''; // 记录上一个朗读的字符，防止重复触发
+    let lastChar = '';
     let synth = window.speechSynthesis;
+    let isActivated = false; // 是否已点击激活
 
-    // 配置语音参数
-    function speak(text) {
-        // 如果正在朗读，先停止（可选，为了流畅度通常直接取消前一个）
-        if (synth.speaking) {
-            synth.cancel();
+    // 创建一个悬浮提示框，告诉用户需要点击
+    const tip = document.createElement('div');
+    tip.innerHTML = '📢 语音脚本已加载，<b>请点击页面任意处激活</b>';
+    tip.style = 'position:fixed; top:10px; right:10px; z-index:9999; background:#fffbe6; border:1px solid #ffe58f; padding:8px 15px; border-radius:4px; font-size:12px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,0.15);';
+    document.body.appendChild(tip);
+
+    // 用户点击页面后激活
+    window.addEventListener('click', () => {
+        if (!isActivated) {
+            isActivated = true;
+            tip.innerHTML = '✅ 语音已激活，移动鼠标到汉字上试试';
+            setTimeout(() => tip.style.display = 'none', 2000);
+
+            // 预热语音引擎 (有些浏览器首跳需要空运行一次)
+            let msg = new SpeechSynthesisUtterance('');
+            synth.speak(msg);
+            console.log("语音引擎已激活");
         }
+    }, { once: true });
+
+    function speak(text) {
+        if (!isActivated) return;
+
+        if (synth.speaking) synth.cancel();
 
         let utterance = new SpeechSynthesisUtterance(text);
-        utterance.lang = 'zh-CN'; // 设置为中文
-        utterance.rate = 1.0; // 语速
-        utterance.pitch = 1.0; // 音调
+        utterance.lang = 'zh-CN';
+        // 尝试获取中文嗓音，如果没指定，浏览器会自动选默认的
+        let voices = synth.getVoices();
+        let zhVoice = voices.find(v => v.lang.includes('zh-CN'));
+        if (zhVoice) utterance.voice = zhVoice;
+
+        utterance.onend = () => console.log('读完啦:', text);
+        utterance.onerror = (e) => console.error('朗读出错:', e);
+
         synth.speak(utterance);
     }
 
-    // 核心逻辑：获取鼠标位置的字符
     document.addEventListener('mousemove', function(e) {
+        if (!isActivated) return;
+
         let range, textNode, offset, char;
 
-        // Chrome, Edge, Safari 支持 caretRangeFromPoint
         if (document.caretRangeFromPoint) {
             range = document.caretRangeFromPoint(e.clientX, e.clientY);
             if (!range) return;
             textNode = range.startContainer;
             offset = range.startOffset;
-        }
-        // Firefox 支持 caretPositionFromPoint
-        else if (document.caretPositionFromPoint) {
+        } else if (document.caretPositionFromPoint) {
             let position = document.caretPositionFromPoint(e.clientX, e.clientY);
             if (!position) return;
             textNode = position.offsetNode;
             offset = position.offset;
         }
 
-        // 确保获取的是文本节点
         if (textNode && textNode.nodeType === Node.TEXT_NODE) {
             char = textNode.textContent.charAt(offset);
 
-            // 正则表达式判断是否为汉字 (Unicode 范围)
+            // 匹配汉字或英文单词
             if (/[\u4e00-\u9fa5]/.test(char)) {
-                // 如果字符变了才朗读，避免鼠标微动导致重复读同一个字
                 if (char !== lastChar) {
+                    console.log("捕获到汉字:", char);
                     lastChar = char;
                     speak(char);
                 }
             } else {
-                lastChar = ''; // 移出汉字区域，重置状态
+                lastChar = '';
             }
-        } else {
-            lastChar = '';
         }
     }, { passive: true });
-
 })();
