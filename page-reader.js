@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页逐句悬停朗读 (结构无损版)
 // @namespace    http://tampermonkey.net/
-// @version      5.0
+// @version      5.2
 // @description  鼠标悬停高亮句子并朗读，完全不破坏页面结构（CSS Highlight API + 安全降级）
 // @author       Gemini
 // @match        *://*/*
@@ -35,6 +35,15 @@
     let lastRequest = null;
     let hoverTimer = null;
     let lastSpokenText = '';
+
+    const IGNORE_SELECTOR = 'input, textarea, select, button, option, label, [contenteditable="true"], .v-tts-span-active';
+    const TEXT_CONTAINER_SELECTOR = [
+        'p', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'td', 'th', 'dt', 'dd', 'figcaption', 'caption', 'blockquote',
+        '.hatnote', '[role="note"]', '.msgbox-title', '.msgbox-text',
+        '.infobox-row-label', '.infobox-row-field', '.gallerytext', '.mob-name'
+    ].join(', ');
+    const TEXT_NODE = Node.TEXT_NODE;
 
     function stopSpeaking() {
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
@@ -72,63 +81,154 @@
         });
     }
 
+    function isSentenceBoundary(text, index) {
+        const char = text[index];
+        if (!char) return false;
+        if ('。！？!?\n\r'.includes(char)) return true;
+        return char === '.' && (index === text.length - 1 || /\s/.test(text[index + 1]));
+    }
+
+    function getCaretRangeFromPoint(x, y) {
+        if (document.caretRangeFromPoint) return document.caretRangeFromPoint(x, y);
+        if (document.caretPositionFromPoint) {
+            const pos = document.caretPositionFromPoint(x, y);
+            if (!pos) return null;
+            const range = document.createRange();
+            range.setStart(pos.offsetNode, pos.offset);
+            range.collapse(true);
+            return range;
+        }
+        return null;
+    }
+
+    function isVisibleTextNode(node) {
+        if (!node || node.nodeType !== TEXT_NODE || !node.textContent.trim()) return false;
+        const parent = node.parentElement;
+        if (!parent || parent.closest(IGNORE_SELECTOR)) return false;
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const visible = Array.from(range.getClientRects()).some(rect => rect.width > 0 && rect.height > 0);
+        range.detach();
+        return visible;
+    }
+
+    function isPointInTextNode(node, x, y) {
+        if (!isVisibleTextNode(node)) return false;
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const hit = Array.from(range.getClientRects()).some(rect =>
+            x >= rect.left - 1 && x <= rect.right + 1 &&
+            y >= rect.top - 1 && y <= rect.bottom + 1
+        );
+        range.detach();
+        return hit;
+    }
+
+    function isPointOnText(container, x, y) {
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                return isVisibleTextNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+            }
+        });
+        let node;
+        while (node = walker.nextNode()) {
+            if (isPointInTextNode(node, x, y)) return true;
+        }
+        return false;
+    }
+
+    function textNodesIn(container) {
+        const nodes = [];
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                return isVisibleTextNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+            }
+        });
+        let node;
+        while (node = walker.nextNode()) nodes.push(node);
+        return nodes;
+    }
+
+    function locateTextPosition(nodes, absoluteOffset) {
+        let currentPos = 0;
+        for (const node of nodes) {
+            const len = node.textContent.length;
+            if (absoluteOffset <= currentPos + len) {
+                return { node, offset: Math.max(0, absoluteOffset - currentPos) };
+            }
+            currentPos += len;
+        }
+        const last = nodes[nodes.length - 1];
+        return last ? { node: last, offset: last.textContent.length } : null;
+    }
+
     // --- 断句核心：获取当前句子文字与 DOM Range ---
     function getFullSentence(e) {
         const target = e.target;
+        if (!(target instanceof Element)) return null;
         // 忽略表单控件和已有高亮区域
-        if (target.matches('input, textarea, select, button, option, label, [contenteditable="true"], .v-tts-span-active')) return null;
-        if (target.tagName === 'A') {
-            return { text: target.innerText, nodes: [target] };
+        if (target.closest(IGNORE_SELECTOR)) return null;
+
+        const link = target.closest('a');
+        if (link) {
+            const text = (link.innerText || link.textContent || link.getAttribute('aria-label') || link.title || '').trim();
+            if (text.length < 1) return null;
+            return { text, nodes: [link] };
+        }
+
+        const range = getCaretRangeFromPoint(e.clientX, e.clientY);
+        if (!range) return null;
+        if (!isPointInTextNode(range.startContainer, e.clientX, e.clientY)) return null;
+
+        const rangeElement = range.startContainer.nodeType === TEXT_NODE
+            ? range.startContainer.parentElement
+            : range.startContainer;
+        if (!(rangeElement instanceof Element) || rangeElement.closest(IGNORE_SELECTOR)) return null;
+
+        const rangeLink = rangeElement.closest('a');
+        if (rangeLink) {
+            const text = (rangeLink.innerText || rangeLink.textContent || rangeLink.getAttribute('aria-label') || rangeLink.title || '').trim();
+            if (text.length < 1) return null;
+            return { text, nodes: [rangeLink] };
         }
 
         // 寻找最近的块级/单元格容器，确保不跨 td/th 破坏表格
-        const container = target.closest('p, li, h1, h2, h3, h4, h5, h6, td, th, article, section, div[class*="content"]');
+        const container = rangeElement.closest(TEXT_CONTAINER_SELECTOR) || target.closest(TEXT_CONTAINER_SELECTOR);
         if (!container) return null;
+        if (!isPointOnText(container, e.clientX, e.clientY)) return null;
 
-        const fullText = container.innerText;
-        const range = document.caretRangeFromPoint(e.clientX, e.clientY);
-        if (!range) return null;
+        const nodes = textNodesIn(container);
+        const textParts = [];
+        let offset = -1;
+        let currentPos = 0;
+        for (const node of nodes) {
+            textParts.push(node.textContent);
+            if (node === range.startContainer) offset = currentPos + range.startOffset;
+            currentPos += node.textContent.length;
+        }
+        if (offset < 0) return null;
 
-        // 计算鼠标在 innerText 中的偏移
-        const preRange = document.createRange();
-        preRange.selectNodeContents(container);
-        preRange.setEnd(range.startContainer, range.startOffset);
-        const offset = preRange.toString().length;
+        const fullText = textParts.join('');
 
         // 按标点分句
-        const delimiters = /[。！？\n\r]|(\.\s)/;
         let start = offset;
-        while (start > 0 && !delimiters.test(fullText[start - 1])) start--;
+        while (start > 0 && !isSentenceBoundary(fullText, start - 1)) start--;
         let end = offset;
-        while (end < fullText.length && !delimiters.test(fullText[end])) end++;
+        while (end < fullText.length && !isSentenceBoundary(fullText, end)) end++;
         if (end < fullText.length) end++;
+        while (start < end && /\s/.test(fullText[start])) start++;
+        while (end > start && /\s/.test(fullText[end - 1])) end--;
 
         const sentenceText = fullText.substring(start, end).trim();
         if (sentenceText.length < 2) return null;
 
         // 将字符偏移还原为 DOM Range（仅限容器内文本节点）
         const finalRange = document.createRange();
-        let currentPos = 0;
-        let startNode, startOffset, endNode, endOffset;
-        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null, false);
-        let node;
-        while (node = walker.nextNode()) {
-            const len = node.textContent.length;
-            if (!startNode && currentPos + len >= start) {
-                startNode = node;
-                startOffset = Math.max(0, start - currentPos);
-            }
-            if (currentPos + len >= end) {
-                endNode = node;
-                endOffset = Math.min(node.textContent.length, end - currentPos);
-                break;
-            }
-            currentPos += len;
-        }
-
-        if (startNode && endNode) {
-            finalRange.setStart(startNode, Math.max(0, startOffset));
-            finalRange.setEnd(endNode, Math.min(endNode.textContent.length, endOffset));
+        const startPos = locateTextPosition(nodes, start);
+        const endPos = locateTextPosition(nodes, end);
+        if (startPos && endPos) {
+            finalRange.setStart(startPos.node, Math.min(startPos.node.textContent.length, startPos.offset));
+            finalRange.setEnd(endPos.node, Math.min(endPos.node.textContent.length, endPos.offset));
             return { text: sentenceText, range: finalRange };
         }
         return null;
@@ -241,6 +341,12 @@
         highlightSystem.remove();
     }
 
+    function clearActive() {
+        removeHighlight();
+        stopSpeaking();
+        lastSpokenText = '';
+    }
+
     // 为链接节点创建临时 Range
     function createRangeFromNode(node) {
         const r = document.createRange();
@@ -255,35 +361,20 @@
             if (e.target.closest('.v-tts-span-active')) return;
             const result = getFullSentence(e);
             if (result) {
-                if (result.text !== lastSpokenText) {
-                    applyHighlight(result.range || createRangeFromNode(result.nodes[0]));
-                    speak(result.text);
-                }
+                applyHighlight(result.range || createRangeFromNode(result.nodes[0]));
+                speak(result.text);
             } else {
-                removeHighlight();
-                stopSpeaking();
-                lastSpokenText = '';
+                clearActive();
             }
         }, 100);
     });
 
-    document.addEventListener('mouseout', (e) => {
-        if (!e.relatedTarget || !e.relatedTarget.closest('.v-tts-span-active')) {
-            setTimeout(() => {
-                if (!document.querySelector('.v-tts-span-active')?.contains(document.activeElement)) {
-                    removeHighlight();
-                    stopSpeaking();
-                    lastSpokenText = '';
-                }
-            }, 150);
-        }
-    });
+    document.documentElement.addEventListener('mouseleave', clearActive);
+    window.addEventListener('blur', clearActive);
 
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
-            stopSpeaking();
-            removeHighlight();
-            lastSpokenText = '';
+            clearActive();
         }
     });
 
