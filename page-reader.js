@@ -4,7 +4,7 @@
 // @version      5.2
 // @description  鼠标悬停高亮句子并朗读，完全不破坏页面结构（CSS Highlight API + 安全降级）
 // @author       Gemini
-// @match        *://*/*
+// @match        *://*.minecraft.wiki/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -28,6 +28,12 @@
         appId: GM_getValue('volc_appid', ''),
         token: GM_getValue('volc_token', ''),
         voice: GM_getValue('volc_voice', 'BV001_streaming'),
+        // 音色列表
+        // BV700_V2_streaming 灿灿 2.0
+        // BV001_V2_streaming 通用女声 2.0
+        // BV700_streaming 灿灿
+        // BV001_streaming 通用女声
+        // BV002_streaming 通用男声
     });
 
     // --- TTS 引擎 ---
@@ -60,16 +66,34 @@
 
         const reqid = Math.random().toString(36).slice(2);
         const requestData = {
-            app: { appid: config.appId, token: config.token, cluster: "volcano_tts" },
-            user: { uid: "user_js" },
-            audio: { encoding: "mp3", voice_type: config.voice, speed_ratio: 1.0, volume_ratio: 1.0, pitch_ratio: 1.0 },
-            request: { reqid: reqid, text: text, text_type: "plain", operation: "query" }
+            app: {
+                appid: config.appId,
+                token: config.token,
+                cluster: "volcano_tts"
+            },
+            user: {
+                uid: "user_js"
+            },
+            audio: {
+                encoding: "mp3",
+                voice_type: config.voice,
+                speed_ratio: 1.0
+            },
+            request: {
+                reqid: reqid,
+                text: text,
+                text_type: "plain",
+                operation: "query"
+            }
         };
 
         lastRequest = GM_xmlhttpRequest({
             method: "POST",
             url: "https://openspeech.bytedance.com/api/v1/tts",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer;${config.token}` },
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer;${config.token}`
+            },
             data: JSON.stringify(requestData),
             responseType: "json",
             onload: function(res) {
