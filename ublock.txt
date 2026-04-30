@@ -1,0 +1,5 @@
+zh.minecraft.wiki##.mw-editsection
+zh.minecraft.wiki##figure.embedvideo
+zh.minecraft.wiki##table[data-description="History"]
+zh.minecraft.wiki##.mw-references-wrap
+zh.minecraft.wiki##.mw-dismissable-notice-body
