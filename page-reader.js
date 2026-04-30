@@ -24,6 +24,11 @@
     `);
 
     // --- 配置 ---
+    function parseSpeedRatio(value) {
+        const parsed = Number.parseFloat(value);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : 1.0;
+    }
+
     const getConfig = () => ({
         appId: GM_getValue('volc_appid', ''),
         token: GM_getValue('volc_token', ''),
@@ -34,6 +39,7 @@
         // BV001_streaming 通用女声
         // BV002_streaming 通用男声
         voice: GM_getValue('volc_voice', 'BV001_streaming'),
+        speedRatio: parseSpeedRatio(GM_getValue('volc_speed_ratio', 1.0)),
     });
 
     // --- TTS 引擎 ---
@@ -47,7 +53,8 @@
         'p', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
         'td', 'th', 'dt', 'dd', 'figcaption', 'caption', 'blockquote',
         '.hatnote', '[role="note"]', '.msgbox-title', '.msgbox-text',
-        '.infobox-row-label', '.infobox-row-field', '.gallerytext', '.mob-name'
+        '.infobox-row-label', '.infobox-row-field', '.gallerytext', '.mob-name',
+        '.collapsible', '.jslink'
     ].join(', ');
     const TEXT_NODE = Node.TEXT_NODE;
 
@@ -77,7 +84,7 @@
             audio: {
                 encoding: "mp3",
                 voice_type: config.voice,
-                speed_ratio: 1.0
+                speed_ratio: config.speedRatio
             },
             request: {
                 reqid: reqid,
@@ -407,9 +414,11 @@
         const appId = prompt("AppID:", GM_getValue('volc_appid', ''));
         const token = prompt("Access Token:", GM_getValue('volc_token', ''));
         const voice = prompt("Voice:", GM_getValue('volc_voice', 'BV001_streaming'));
+        const speedRatio = prompt("Speed Ratio:", GM_getValue('volc_speed_ratio', 1.0));
         if (appId) GM_setValue('volc_appid', appId);
         if (token) GM_setValue('volc_token', token);
         if (voice) GM_setValue('volc_voice', voice);
+        GM_setValue('volc_speed_ratio', parseSpeedRatio(speedRatio));
         alert("保存成功！");
     });
 })();
