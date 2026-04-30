@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         网页逐句悬停朗读 (结构无损版)
+// @name         网页逐句悬停朗读(tts_v3接口)
 // @namespace    http://tampermonkey.net/
-// @version      5.2
+// @version      5.3
 // @description  鼠标悬停高亮句子并朗读，完全不破坏页面结构（CSS Highlight API + 安全降级）
 // @author       Gemini
 // @match        *://*.minecraft.wiki/*
@@ -24,23 +24,29 @@
     `);
 
     // --- 配置 ---
+    const V3_TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional";
+    const DEFAULT_V3_RESOURCE_ID = "volc.service_type.10029";
+    const DEFAULT_V3_SPEAKER = "zh_female_shuangkuaisisi_moon_bigtts";
+
+    function getVoiceConfig() {
+        const savedVoice = GM_getValue('volc_voice', DEFAULT_V3_SPEAKER);
+        return /^BV\d/i.test(savedVoice) ? DEFAULT_V3_SPEAKER : savedVoice;
+    }
+
     const getConfig = () => ({
         appId: GM_getValue('volc_appid', ''),
         token: GM_getValue('volc_token', ''),
-        voice: GM_getValue('volc_voice', 'BV001_streaming'),
-        // 音色列表
-        // BV700_V2_streaming 灿灿 2.0
-        // BV001_V2_streaming 通用女声 2.0
-        // BV700_streaming 灿灿
-        // BV001_streaming 通用女声
-        // BV002_streaming 通用男声
+        voice: getVoiceConfig(),
+        resourceId: GM_getValue('volc_resource_id', DEFAULT_V3_RESOURCE_ID)
     });
 
     // --- TTS 引擎 ---
     let currentAudio = null;
+    let currentAudioStream = null;
     let lastRequest = null;
     let hoverTimer = null;
     let lastSpokenText = '';
+    let speechRequestId = 0;
 
     const IGNORE_SELECTOR = 'input, textarea, select, button, option, label, [contenteditable="true"], .v-tts-span-active';
     const TEXT_CONTAINER_SELECTOR = [
@@ -52,8 +58,99 @@
     const TEXT_NODE = Node.TEXT_NODE;
 
     function stopSpeaking() {
+        speechRequestId++;
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        if (currentAudioStream) { currentAudioStream.abort(); currentAudioStream = null; }
         if (lastRequest) { lastRequest.abort(); lastRequest = null; }
+    }
+
+    function makeRequestId() {
+        if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+        return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    }
+
+    function decodeBase64Bytes(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    }
+
+    function createStreamingAudio() {
+        const chunks = [];
+        let started = false;
+        let closed = false;
+        let objectUrl = '';
+        let mediaSource = null;
+        let sourceBuffer = null;
+        let queue = [];
+        const audio = new Audio();
+        currentAudio = audio;
+
+        function playOnce() {
+            if (!audio.src) return;
+            if (started) return;
+            started = true;
+            audio.play().catch(() => { started = false; });
+        }
+
+        function appendNext() {
+            if (!sourceBuffer || sourceBuffer.updating) return;
+            if (queue.length) {
+                sourceBuffer.appendBuffer(queue.shift());
+                return;
+            }
+            if (closed && mediaSource && mediaSource.readyState === 'open') {
+                try { mediaSource.endOfStream(); } catch (e) {}
+            }
+        }
+
+        function playFallback() {
+            if (!chunks.length) return;
+            const blob = new Blob(chunks, { type: 'audio/mpeg' });
+            objectUrl = URL.createObjectURL(blob);
+            audio.src = objectUrl;
+            playOnce();
+        }
+
+        const canStream = typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported('audio/mpeg');
+        if (canStream) {
+            mediaSource = new MediaSource();
+            objectUrl = URL.createObjectURL(mediaSource);
+            audio.src = objectUrl;
+            mediaSource.addEventListener('sourceopen', () => {
+                if (!mediaSource || mediaSource.readyState !== 'open') return;
+                sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+                sourceBuffer.addEventListener('updateend', appendNext);
+                appendNext();
+            }, { once: true });
+        }
+
+        return {
+            append(bytes) {
+                chunks.push(bytes);
+                if (mediaSource) {
+                    queue.push(bytes);
+                    appendNext();
+                    playOnce();
+                }
+            },
+            close() {
+                closed = true;
+                if (mediaSource) {
+                    appendNext();
+                    return;
+                }
+                playFallback();
+            },
+            abort() {
+                closed = true;
+                queue = [];
+                if (objectUrl) URL.revokeObjectURL(objectUrl);
+                audio.removeAttribute('src');
+                audio.load();
+            }
+        };
     }
 
     function speak(text) {
@@ -63,44 +160,83 @@
         if (!config.appId || !config.token) return;
         stopSpeaking();
         lastSpokenText = text;
+        const requestId = speechRequestId;
+        const audioStream = createStreamingAudio();
+        currentAudioStream = audioStream;
+        let processedLength = 0;
+        let pendingLine = '';
 
-        const reqid = Math.random().toString(36).slice(2);
         const requestData = {
-            app: {
-                appid: config.appId,
-                token: config.token,
-                cluster: "volcano_tts"
-            },
             user: {
                 uid: "user_js"
             },
-            audio: {
-                encoding: "mp3",
-                voice_type: config.voice,
-                speed_ratio: 1.0
-            },
-            request: {
-                reqid: reqid,
+            req_params: {
                 text: text,
-                text_type: "plain",
-                operation: "query"
+                speaker: config.voice,
+                audio_params: {
+                    format: "mp3",
+                    sample_rate: 24000
+                }
             }
         };
 
+        function handleLine(line) {
+            if (!line || requestId !== speechRequestId) return;
+            let payload;
+            try {
+                payload = JSON.parse(line);
+            } catch (e) {
+                return;
+            }
+            if (payload.data) {
+                audioStream.append(decodeBase64Bytes(payload.data));
+                return;
+            }
+            const code = Number(payload.code);
+            if (payload.error || (payload.code != null && code !== 20000000 && code !== 0)) {
+                console.warn('TTS V3 请求失败', payload);
+            }
+        }
+
+        function processResponseText(responseText, flush) {
+            if (requestId !== speechRequestId || !responseText) return;
+            const nextText = responseText.slice(processedLength);
+            processedLength = responseText.length;
+            const lines = (pendingLine + nextText).split(/\r?\n/);
+            pendingLine = flush ? '' : lines.pop();
+            lines.forEach(handleLine);
+            if (flush && pendingLine) handleLine(pendingLine);
+        }
+
         lastRequest = GM_xmlhttpRequest({
             method: "POST",
-            url: "https://openspeech.bytedance.com/api/v1/tts",
+            url: V3_TTS_URL,
             headers: {
                 "Content-Type": "application/json",
-                "Authorization": `Bearer;${config.token}`
+                "X-Api-App-Id": config.appId,
+                "X-Api-Access-Key": config.token,
+                "X-Api-Resource-Id": config.resourceId,
+                "X-Api-Request-Id": makeRequestId()
             },
             data: JSON.stringify(requestData),
-            responseType: "json",
+            responseType: "text",
+            onprogress: function(res) {
+                processResponseText(res.responseText || '', false);
+            },
             onload: function(res) {
-                if (res.status === 200 && res.response && res.response.data) {
-                    currentAudio = new Audio(`data:audio/mp3;base64,${res.response.data}`);
-                    currentAudio.play().catch(() => {});
-                }
+                if (requestId !== speechRequestId) return;
+                processResponseText(res.responseText || '', true);
+                audioStream.close();
+                lastRequest = null;
+            },
+            onerror: function(err) {
+                if (requestId !== speechRequestId) return;
+                console.warn('TTS V3 请求失败', err);
+                audioStream.abort();
+                lastRequest = null;
+            },
+            onabort: function() {
+                if (requestId === speechRequestId) lastRequest = null;
             }
         });
     }
@@ -406,8 +542,12 @@
     GM_registerMenuCommand("⚙️ 配置火山引擎", () => {
         const appId = prompt("AppID:", GM_getValue('volc_appid', ''));
         const token = prompt("Access Token:", GM_getValue('volc_token', ''));
+        const speaker = prompt("V3 Speaker:", getVoiceConfig());
+        const resourceId = prompt("V3 Resource ID:", GM_getValue('volc_resource_id', DEFAULT_V3_RESOURCE_ID));
         if (appId) GM_setValue('volc_appid', appId);
         if (token) GM_setValue('volc_token', token);
+        if (speaker) GM_setValue('volc_voice', speaker);
+        if (resourceId) GM_setValue('volc_resource_id', resourceId);
         alert("保存成功！");
     });
 })();
